@@ -1,0 +1,91 @@
+% Parameter estimation
+clearvars;
+clc;
+
+%% 1. Import and Read Data
+opts = detectImportOptions('01.csv', 'Delimiter', ';');
+traceTable = readtable('01.csv', opts);
+raw_amplitudes = traceTable.CPUUsage_MHZ_;
+
+%% 2. Isolate Leftmost Peak & Clean Data
+valid_data = raw_amplitudes(~isnan(raw_amplitudes) & ~isinf(raw_amplitudes));
+baseline_data = valid_data(valid_data > 0 & valid_data < 2000);
+baseline_data = baseline_data(:); 
+
+%% 3. Data Integrity Check
+fprintf('=== Data Diagnosis ===\n');
+fprintf('Total rows in CSV column: %d\n', length(raw_amplitudes));
+fprintf('Rows found between 0 and 2000 MHz: %d\n', length(baseline_data));
+fprintf('Data Range: Min = %f, Max = %f\n', min(baseline_data), max(baseline_data));
+fprintf('Data Variance: %f\n', var(baseline_data));
+fprintf('======================\n\n');
+
+%% 4. Test and Rank Distributions Programmatically
+distributions = {'Lognormal', 'Gamma', 'Weibull', 'Exponential'};
+
+best_aic = Inf;
+best_dist_name = '';
+best_fit_obj = [];
+
+fprintf('--- Distribution Fit Comparison (Lower AIC is Better) ---\n');
+for i = 1:length(distributions)
+    try
+        % Fit the distribution
+        fit_obj = fitdist(baseline_data, distributions{i});
+
+        % Step A: Manually calculate the Log-Likelihood using the PDF
+        y_density = pdf(fit_obj, baseline_data);
+        y_density(y_density <= 0) = eps; % Prevent log(0) errors
+        LL = sum(log(y_density));
+
+        % Step B: Assign number of parameters (k) manually to avoid object property bugs
+        if strcmp(distributions{i}, 'Exponential')
+            k = 1;
+        else
+            k = 2; % Lognormal, Gamma, and Weibull all have 2 parameters
+        end
+
+        % Step C: Compute AIC (2k - 2LL)
+        current_aic = 2*k - 2*LL;
+
+        fprintf('%-12s AIC: %.2f\n', distributions{i}, current_aic);
+
+        if current_aic < best_aic
+            best_aic = current_aic;
+            best_dist_name = distributions{i};
+            best_fit_obj = fit_obj;
+        end
+    catch ME
+        fprintf('%-12s: Fit failed (%s)\n', distributions{i}, ME.message);
+    end
+end
+fprintf('---------------------------------------------------------\n');
+
+%% 5. Plotting
+if ~isempty(best_dist_name)
+    fprintf('Winner: The best fitting distribution is **%s**\n\n', best_dist_name);
+
+    figure('Name', 'Best Fitting Baseline Distribution', 'NumberTitle', 'off');
+    histogram(baseline_data, 50, 'Normalization', 'pdf', ...
+        'FaceColor', [0.2, 0.4, 0.7], 'EdgeColor', 'w', 'FaceAlpha', 0.7);
+    hold on;
+
+    x_eval = linspace(min(baseline_data), 500, 1000);
+    y_pdf = pdf(best_fit_obj, x_eval);
+
+    plot(x_eval, y_pdf, 'r-', 'LineWidth', 2.5);
+    title(['Best Fit Baseline Model: ' best_dist_name]);
+    xlabel('CPU Usage [MHz]');
+    ylabel('Probability Density');
+    legend('Baseline Data (<2000 MHz)', [best_dist_name ' Fit Line']);
+    grid on;
+    hold off;
+
+    disp('--- Parameters for the Winning Model ---');
+    disp(best_fit_obj);
+else
+    warning('No successful distribution fit found.');
+end
+
+coverage = (sum(raw_amplitudes < 500) / length(raw_amplitudes)) * 100;
+fprintf('Percentage of data below 2000 MHz: %.2f%%\n', coverage);

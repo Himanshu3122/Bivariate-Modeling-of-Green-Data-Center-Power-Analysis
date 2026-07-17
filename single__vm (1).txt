@@ -1,0 +1,127 @@
+clc;
+clear;
+close all;
+rng default;
+
+% =========================================================================
+% CONFIGURATION PARAMETERS 
+% =========================================================================
+t_max = 24;          % Continuous runtime in HOURS
+lambda_max = 13.62;  % Peak bounding rate (req/sec)
+lambda_max_hour = lambda_max * 3600; 
+
+window_minutes = 5;
+window_hours = window_minutes / 60;          
+total_bins = 24 / window_hours; % Exactly 288 intervals
+
+% Buffer the simulation time slightly to collect symmetric metrics for the last bin
+t_sim_max = t_max + window_hours; 
+
+% =========================================================================
+% PHASE 1: NHPP TRAFFIC GENERATION ENGINE
+% =========================================================================
+total_expected_candidates = poissrnd(lambda_max_hour * t_sim_max);
+u = rand(1, total_expected_candidates);
+exponential_gaps = -1 * log(u) / lambda_max_hour;
+arrivals = cumsum(exponential_gaps);
+arrivals = arrivals(arrivals <= t_sim_max); % Collect buffered window arrivals
+total_actual_candidates = length(arrivals);
+
+p_t = zeros(1, total_actual_candidates);
+idx1 = (arrivals >= 0)    & (arrivals < 3);
+idx2 = (arrivals >= 3)    & (arrivals < 16.5);
+idx3 = (arrivals >= 16.5) & (arrivals < 18);
+idx4 = (arrivals >= 18)   & (arrivals < 19.5);
+idx5 = (arrivals >= 19.5) & (arrivals < 22.5);
+idx6 = (arrivals >= 22.5) & (arrivals <= t_sim_max); % Extended spline upper bound
+
+p_t(idx1) = (6.81 + (2.27 * arrivals(idx1))) / lambda_max;
+p_t(idx2) = 13.62 / lambda_max;
+p_t(idx3) = (88.53 - (4.54 * arrivals(idx3))) / lambda_max;
+p_t(idx4) = (47.67 - (2.27 * arrivals(idx4))) / lambda_max;
+p_t(idx5) = 3.405 / lambda_max;
+p_t(idx6) = ((2.27 * arrivals(idx6)) - 47.67) / lambda_max;
+
+w = rand(1, total_actual_candidates);
+accepted_indices = (w <= p_t);
+arrivals = arrivals(accepted_indices);
+
+
+bin_indices = floor(arrivals / window_hours) + 1;
+% Safely strip out-of-bounds trailing events that fall beyond the 288th tracking bin
+valid_indices = bin_indices <= total_bins;
+bin_indices = bin_indices(valid_indices);
+
+% Adjust tracking components to match the active time horizon filter
+num_events = length(bin_indices);
+
+% =========================================================================
+% TRACK 1: SERVER REQUEST UTILIZATION (NHPP TRAFFIC DENSITY)
+% =========================================================================
+counts_per_bin = accumarray(bin_indices', 1, [total_bins, 1])';
+max_req_capacity_per_bin = 4500; 
+utilization_requests = (counts_per_bin / max_req_capacity_per_bin) * 100;
+utilization_requests(utilization_requests > 100) = 100; 
+
+% =========================================================================
+% TRACK 2: COMPUTATIONAL WORKLOAD UTILIZATION (DECOUPLED AVERAGE LOGNORMAL LOAD)
+% =========================================================================
+mu_param = 4.97268;
+sigma_param = 0.206077;
+target_mhz_per_bin = lognrnd(mu_param, sigma_param, 1, total_bins);
+
+% Regenerate workloads utilizing only valid within-horizon arrivals
+spike_target_mhz = target_mhz_per_bin(bin_indices);
+random_variation = 0.85 + (1.15 - 0.85) * rand(1, num_events); 
+workloads = spike_target_mhz .* random_variation;
+
+sum_workload_per_bin = accumarray(bin_indices', workloads', [total_bins, 1])';
+simulated_mhz_profile = zeros(1, total_bins);
+active_bins = counts_per_bin > 0;
+simulated_mhz_profile(active_bins) = sum_workload_per_bin(active_bins) ./ counts_per_bin(active_bins);
+
+core_max_mhz = 2000;
+utilization_load = (simulated_mhz_profile / core_max_mhz) * 100;
+utilization_load(utilization_load > 100) = 100;
+% =========================================================================
+% PHASE 4: UNCONSTRAINED POWER MODEL (ALWAYS 30W CEILING)
+% =========================================================================
+time_axis_5min = (0:total_bins-1) * window_hours;
+power_profile_watts = zeros(1, total_bins);
+
+for t = 1:total_bins
+    P_static_floor = 15.0;  
+    P_weight_network = 4.0;  
+    P_weight_compute = 11.0; 
+    
+    power_profile_watts(t) = P_static_floor ...
+        + (P_weight_network * (utilization_requests(t) / 100)) ...
+        + (P_weight_compute * (utilization_load(t) / 100));
+end
+
+% =========================================================================
+% PHASE 5: TELEMETRY VISUALIZATION
+% =========================================================================
+figure('Position', [100, 100, 950, 850]);
+
+subplot(3, 1, 1);
+plot(time_axis_5min, utilization_requests, 'LineWidth', 2.2, 'Color', [0.8500 0.3250 0.0980]);
+xlim([0, t_max]); ylim([0, max(utilization_requests)*1.3+1]); set(gca, 'XTick', 0:2:24);
+grid on; ylabel('Request Utilization (%)');
+title('\bf Track 1: Server Request Processing Profile (Unconstrained Case)');
+
+subplot(3, 1, 2);
+plot(time_axis_5min, utilization_load, 'LineWidth', 2.2, 'Color', [0.4660 0.6740 0.1880]);
+xlim([0, t_max]); ylim([0, max(utilization_load)*1.5+1]); set(gca, 'XTick', 0:2:24);
+grid on; ylabel('Computational Load (%)');
+title('\bf Track 2: Core Computational Execution Profile (Isolated Average)');
+
+subplot(3, 1, 3);
+plot(time_axis_5min, power_profile_watts, 'LineWidth', 2.5, 'Color', [0 0.4470 0.7410]);
+xlim([0, t_max]); ylim([0, 35]); set(gca, 'XTick', 0:2:24);
+grid on; xlabel('Simulation Timeline (Hours)'); ylabel('Total Power Draw (Watts)');
+title('\bf Fused Bivariate Power Footprint (Natural Operational Variance)');
+
+fprintf('=== Unthrottled Telemetry Report ===\n');
+fprintf('24-Hour Average Core Draw: %.2f Watts\n', mean(power_profile_watts));
+figure;

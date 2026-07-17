@@ -1,0 +1,123 @@
+%NHPP
+clc;
+clear;
+close all;
+rng default;
+
+% =========================================================================
+% CONFIGURATION PARAMETERS (SCALED TO JUSTIFIABLE 13.62 PEAK OVER 24 HOURS)
+% =========================================================================
+t_max = 24;          % Continuous runtime in HOURS
+lambda_max = 13.62;  % Justifiable peak bounding rate (req/sec)
+
+% 1. Convert global bounding rate to total expected arrivals per hour
+lambda_max_hour = lambda_max * 3600;
+
+% 2. Vectorized Generation: Pre-determine the total number of raw candidates
+% using a single Poisson random variable for the entire 24-hour block
+total_expected_candidates = poissrnd(lambda_max_hour * t_max);
+
+% 3. Generate all raw timestamps at once and sort them continuously
+arrivals = sort(rand(1, total_expected_candidates) * t_max);
+
+% =========================================================================
+% PHASE 2: VECTORIZED PIECEWISE THINNING (NO LOOPS, NO REALLOCATION)
+% =========================================================================
+% Pre-allocate the probability vector
+p_t = zeros(1, total_expected_candidates);
+
+% Apply your exact piecewise profile to the entire vector instantly using logical masks
+idx1 = (arrivals >= 0)    & (arrivals < 3);
+idx2 = (arrivals >= 3)    & (arrivals < 16.5);
+idx3 = (arrivals >= 16.5) & (arrivals < 18);
+idx4 = (arrivals >= 18)   & (arrivals < 19.5);
+idx5 = (arrivals >= 19.5) & (arrivals < 22.5);
+idx6 = (arrivals >= 22.5) & (arrivals <= 24);
+
+p_t(idx1) = (6.81 + (2.27 * arrivals(idx1))) / lambda_max;
+p_t(idx2) = 13.62 / lambda_max;
+p_t(idx3) = (88.53 - (4.54 * arrivals(idx3))) / lambda_max;
+p_t(idx4) = (47.67 - (2.27 * arrivals(idx4))) / lambda_max;
+p_t(idx5) = 3.405 / lambda_max;
+p_t(idx6) = ((2.27 * arrivals(idx6)) - 47.67) / lambda_max;
+
+% Roll a dice for all candidates simultaneously
+w = rand(1, total_expected_candidates);
+
+% Filter down to kept accepted continuous timestamps that pass thinning criteria
+accepted_indices = (w <= p_t);
+arrivals = arrivals(accepted_indices);
+num_events = length(arrivals);
+
+% =========================================================================
+% PHASE 3: CONSTANT UNIT WORKLOAD INJECTION
+% =========================================================================
+% Assign a constant amplitude of 1 to every single accepted arrival
+workloads = ones(1, num_events);
+
+% =========================================================================
+% PHASE 4: THREE-TIER PLOT VISUALIZATION WITH CONSTANT AMPLITUDES
+% =========================================================================
+arrivals_row = arrivals(:)';
+zeros_vec = zeros(1, num_events);
+workloads_row = workloads(:)';
+
+% Vector interleaving to render clean standalone spike lines scaling by workloads
+plot_x_spikes = reshape([arrivals_row; arrivals_row; arrivals_row], [], 1);
+plot_y_spikes = reshape([zeros_vec; workloads_row; zeros_vec], [], 1);
+
+figure('Position', [100, 50, 950, 850]); % Fixed text parsing syntax parameters
+
+% --- Subplot 1: Full 24-Hour Timeline (The Macro View) ---
+subplot(3, 1, 1);
+plot(plot_x_spikes, plot_y_spikes, 'Color', [0.0 0.4470 0.7410 0.3], 'LineWidth', 0.5);
+hold on;
+plot(arrivals, workloads, '.', 'Color', [0.0 0.4470 0.7410], 'MarkerSize', 3);
+ylim([0, 1.2]);
+xlim([0, t_max]);
+set(gca, 'XTick', 0:2:24);
+xlabel('Clock Time (hours)');
+ylabel('Amplitude');
+title('\bf Macro View: Full 24-Hour Continuous Timeline Overview with Unit Amplitudes');
+grid on;
+hold off;
+
+% --- Subplot 2: 15-Second Window (The Micro View) ---
+subplot(3, 1, 2);
+plot(plot_x_spikes, plot_y_spikes, 'Color', [0.8500 0.3250 0.0980], 'LineWidth', 1.2);
+hold on;
+plot(arrivals, workloads, 'o', ...
+    'MarkerFaceColor', [0.8500 0.3250 0.0980], ...
+    'MarkerEdgeColor', [0.8500 0.3250 0.0980], ...
+    'MarkerSize', 3);
+ylim([0, 1.2]);
+
+% Zoom in on a comfortable 15-second window
+zoom1_start = 8.000;
+zoom1_end = 8.0042; % ~15.12 seconds
+xlim([zoom1_start, zoom1_end]);
+xlabel('Clock Time (hours) - Micro Zoomed');
+ylabel('Amplitude');
+title(sprintf('\\bf Micro View: Stochastic Multi-Event Cluster (Zoom Window: %.3f to %.4f Hours)', zoom1_start, zoom1_end));
+grid on;
+hold off;
+
+% --- Subplot 3: Deep 1-Second Window (The Nano View) ---
+subplot(3, 1, 3);
+plot(plot_x_spikes, plot_y_spikes, 'Color', [0.4660 0.6740 0.1880], 'LineWidth', 2.0);
+hold on;
+plot(arrivals, workloads, 'o', ...
+    'MarkerFaceColor', [0.4660 0.6740 0.1880], ...
+    'MarkerEdgeColor', [0.4660 0.4470 0.1880], ...
+    'MarkerSize', 5);
+ylim([0, 1.2]);
+
+% Ultra-deep zoom: 1 second = 1/3600 hours ≈ 0.000278 hours
+zoom2_start = 8.000;
+zoom2_end = 8.000278; % Exactly 1.0008 seconds of real simulation time
+xlim([zoom2_start, zoom2_end]);
+xlabel('Clock Time (hours) - Nano Sub-Second View');
+ylabel('Amplitude');
+title(sprintf('\\bf Nano View: Resolution of Individual Gaps and Amplitudes (Zoom Window: %.3f to %.6f Hours)', zoom2_start, zoom2_end));
+grid on;
+hold off;

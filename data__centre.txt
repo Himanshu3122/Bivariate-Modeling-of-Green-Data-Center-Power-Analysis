@@ -1,0 +1,201 @@
+ear;
+close all;
+rng shuffle; 
+
+% =========================================================================
+% DATA CENTER CLUSTER CONFIGURATION PARAMETERS (MATERNA CLUSTER TOPOLOGY)
+% =========================================================================
+num_vms = 520;                % Total VM fleet size in the Materna Trace-1 cluster
+total_physical_cores = 69;    % Shared physical CPU core pool across the infrastructure
+num_hosts = 49;               % Total physical hypervisor server hosts in the pod
+core_capacity = 2000;         % Single-threaded core capacity baseline ceiling (MHz)
+max_req_capacity_per_bin = 4500; % Peak request processing ceiling per VM per bin
+
+% Global cluster-wide compute ceiling (MHz)
+total_cluster_capacity_mhz = total_physical_cores * core_capacity; % 138,000 MHz
+
+% Traffic parameters for the micro-kernel template
+t_max = 24;          
+lambda_max = 13.62;  
+lambda_max_hour = lambda_max * 3600; 
+
+% Aggregation window structure (5-minute discrete steps)
+window_minutes = 5;
+window_hours = window_minutes / 60;          
+total_bins = 24 / window_hours; % Exactly 288 discrete intervals
+time_axis_5min = (0:total_bins-1) * window_hours;
+
+% Symmetric boundary extension to capture full stochastic densities for the 288th bin
+t_sim_max = t_max + window_hours; 
+
+% =========================================================================
+% PRE-ALLOCATION: DUAL-TRACK MASTER METRIC MATRICES
+% =========================================================================
+master_utilization_requests = zeros(num_vms, total_bins);
+master_utilization_load     = zeros(num_vms, total_bins);
+
+fprintf('=== Initiating Multi-VM Cluster Simulation Loop ===\n');
+fprintf('Simulating %d independent premium virtual machines...\n', num_vms);
+
+mu_param = 4.97268;
+sigma_param = 0.206077;
+
+tic; 
+for vm_id = 1:num_vms
+    
+    % --- MICRO-KERNEL ENGINE STEP 1: TRAFFIC STOCHASTIC GENERATION ---
+    total_expected_candidates = poissrnd(lambda_max_hour * t_sim_max);
+    if total_expected_candidates == 0, continue; end
+    
+    u = rand(1, total_expected_candidates);
+    exponential_gaps = -1 * log(u) / lambda_max_hour;
+    arrivals = cumsum(exponential_gaps);
+    arrivals = arrivals(arrivals <= t_sim_max);
+    
+    if isempty(arrivals), continue; end
+    
+    % --- MICRO-KERNEL STEP 2: VECTORIZED PIECEWISE THINNING ---
+    total_actual_candidates = length(arrivals);
+    p_t = zeros(1, total_actual_candidates);
+    idx1 = (arrivals >= 0)    & (arrivals < 3);
+    idx2 = (arrivals >= 3)    & (arrivals < 16.5);
+    idx3 = (arrivals >= 16.5) & (arrivals < 18);
+    idx4 = (arrivals >= 18)   & (arrivals < 19.5);
+    idx5 = (arrivals >= 19.5) & (arrivals < 22.5);
+    idx6 = (arrivals >= 22.5) & (arrivals <= t_sim_max); % Extended spline ceiling
+    
+    p_t(idx1) = (6.81 + (2.27 * arrivals(idx1))) / lambda_max;
+    p_t(idx2) = 13.62 / lambda_max;
+    p_t(idx3) = (88.53 - (4.54 * arrivals(idx3))) / lambda_max;
+    p_t(idx4) = (47.67 - (2.27 * arrivals(idx4))) / lambda_max;
+    p_t(idx5) = 3.405 / lambda_max;
+    p_t(idx6) = ((2.27 * arrivals(idx6)) - 47.67) / lambda_max;
+    
+    w = rand(1, total_actual_candidates);
+    accepted_indices = (w <= p_t);
+    arrivals = arrivals(accepted_indices);
+    
+    if isempty(arrivals), continue; end
+    
+    bin_indices = floor(arrivals / window_hours) + 1;
+    
+    % Cleanly extract only the valid within-horizon interval indices 
+    valid_indices = bin_indices <= total_bins;
+    bin_indices = bin_indices(valid_indices);
+    
+    if isempty(bin_indices), continue; end
+    num_events = length(bin_indices);
+    
+    % --- TRACK 1: TRACK VM SERVER REQUEST UTILIZATION ---
+    counts_per_bin = accumarray(bin_indices', 1, [total_bins, 1])';
+    vm_util_req = (counts_per_bin / max_req_capacity_per_bin) * 100;
+    vm_util_req(vm_util_req > 100) = 100;
+    master_utilization_requests(vm_id, :) = vm_util_req;
+    
+    % --- TRACK 2: TRACK VM COMPUTATIONAL WORKLOAD (DECOUPLED LOGNORMAL) ---
+    target_mhz_per_bin = lognrnd(mu_param, sigma_param, 1, total_bins);
+    spike_target_mhz = target_mhz_per_bin(bin_indices);
+    random_variation = 0.85 + (1.15 - 0.85) * rand(1, num_events); 
+    workloads = spike_target_mhz .* random_variation;
+    
+    sum_workload_per_bin = accumarray(bin_indices', workloads', [total_bins, 1])';
+    simulated_mhz_profile = zeros(1, total_bins);
+    active_bins = counts_per_bin > 0;
+    simulated_mhz_profile(active_bins) = sum_workload_per_bin(active_bins) ./ counts_per_bin(active_bins);
+    
+    vm_util_load = (simulated_mhz_profile / core_capacity) * 100;
+    vm_util_load(vm_util_load > 100) = 100;
+    master_utilization_load(vm_id, :) = vm_util_load;
+end
+toc;
+fprintf('Cluster loop execution complete.\n\n');
+% =========================================================================
+% PHYSICAL POOL SATURATION CHECK (69-CORE SHARED CEILING)
+% =========================================================================
+total_demanded_mhz = sum(master_utilization_load, 1) / 100 * core_capacity;
+utilization_of_physical_pool = total_demanded_mhz / total_cluster_capacity_mhz * 100;
+[peak_pool_util, peak_bin_idx] = max(utilization_of_physical_pool);
+peak_time_hours = (peak_bin_idx - 1) * window_hours;
+
+fprintf('=== Physical Pool Saturation Check ===\n');
+fprintf('Peak physical pool utilization: %.2f%% (at t = %.2f hours)\n', peak_pool_util, peak_time_hours);
+fprintf('Mean physical pool utilization: %.2f%%\n\n', mean(utilization_of_physical_pool));
+
+% =========================================================================
+% METRIC EXTRACTION LAYER: CLUSTER-WIDE BIVARIATE AGGREGATION
+% =========================================================================
+cluster_request_util_profile = mean(master_utilization_requests, 1);
+cluster_compute_util_profile = mean(master_utilization_load, 1);
+
+% =========================================================================
+% RE-CALIBRATED CLUSTER POWER PARAMETERS (TRUE 49-HOST BIVARIATE PROFILE)
+% =========================================================================
+P_host_static_floor    = 120.0;  % Watts idle floor per blade
+P_host_weight_network  = 30.0;   % Max dynamic network power share per blade
+P_host_weight_compute  = 100.0;  % Max dynamic processing power share per blade (Total max = 250W)
+
+P_cluster_static_floor   = num_hosts * P_host_static_floor;   % 49 * 120 = 5,880 Watts
+P_cluster_weight_network = num_hosts * P_host_weight_network;  % 49 * 30  = 1,470 Watts
+P_cluster_weight_compute = num_hosts * P_host_weight_compute;  % 49 * 100 = 4,900 Watts
+
+% FUSED BIVARIATE POWER ENGINE LOOP
+server_power_watts = zeros(1, total_bins);
+for t = 1:total_bins
+    server_power_watts(t) = P_cluster_static_floor ...
+        + (P_cluster_weight_network * (cluster_request_util_profile(t) / 100)) ...
+        + (P_cluster_weight_compute * (cluster_compute_util_profile(t) / 100));
+end
+
+% Print global metrics to console window for validation
+fprintf('=== Bivariate Infrastructure Validation Metrics ===\n');
+fprintf('Mean Consolidated Cluster Request Util: %.2f%%\n', mean(cluster_request_util_profile));
+fprintf('Mean Consolidated Cluster Compute Load: %.2f%%\n', mean(cluster_compute_util_profile));
+fprintf('Minimum Infrastructure Server Power Draw: %.2f Watts\n', min(server_power_watts));
+fprintf('Peak Infrastructure Server Power Draw: %.2f Watts\n', max(server_power_watts));
+fprintf('Total Daily Cluster Energy Consumption: %.2f Kilowatt-hours (kWh)\n', (mean(server_power_watts) * 24) / 1000);
+
+% =========================================================================
+% VISUALIZATION: MACROSCOPIC CLUSTER METRIC LAYOUT
+% =========================================================================
+figure('Position', [100, 50, 950, 850]);
+
+subplot(3, 1, 1);
+plot(time_axis_5min, cluster_request_util_profile, 'LineWidth', 2.5, 'Color', [0.8500 0.3250 0.0980]);
+xlim([0, t_max]); ylim([0, max(cluster_request_util_profile) * 1.4 + 1]); set(gca, 'XTick', 0:2:24); grid on;
+ylabel('Request Util (%)');
+title('\bf Track 1: Cluster Request Processing Profile (Multi-Tenant Aggregate)');
+
+subplot(3, 1, 2);
+plot(time_axis_5min, cluster_compute_util_profile, 'LineWidth', 2.5, 'Color', [0.4660 0.6740 0.1880]);
+xlim([0, t_max]); ylim([0, max(cluster_compute_util_profile) * 1.4 + 1]); set(gca, 'XTick', 0:2:24); grid on;
+ylabel('Compute Load (%)');
+title('\bf Track 2: Core Computational Execution Profile (Isolated Lognormal Average)');
+
+subplot(3, 1, 3);
+plot(time_axis_5min, server_power_watts, 'LineWidth', 2.5, 'Color', [0 0.4470 0.7410]);
+xlim([0, t_max]); ylim([P_cluster_static_floor * 0.95, (P_cluster_static_floor + P_cluster_weight_network + P_cluster_weight_compute) * 1.05]); 
+set(gca, 'XTick', 0:2:24); grid on;
+xlabel('Simulation Timeline (Hours)'); ylabel('Power Draw (Watts)');
+title('\bf Fused Bivariate Power Footprint (49 Blades - Real-Scale Consolidated IT Load)');
+
+% =========================================================================
+% PHASE 8: ETAP DATA EXTRACTION LAYER (EXCEL EXPORT INTERFACE)
+% =========================================================================
+fprintf('\n=== Executing ETAP Data Extraction Engine ===\n');
+
+hours_int = floor(time_axis_5min);
+mins_int = round((time_axis_5min - hours_int) * 60);
+timestamp_strings = cell(total_bins, 1);
+
+for i = 1:total_bins
+    timestamp_strings{i} = sprintf('%02d:%02d', hours_int(i), mins_int(i));
+end
+
+server_power_kw = server_power_watts(:) / 1000;
+
+etap_export_table = table(time_axis_5min(:), timestamp_strings, server_power_watts(:), server_power_kw, ...
+    'VariableNames', {'Decimal_Time_Hours', 'Clock_Time_HH_MM', 'Active_Power_Watts', 'Active_Power_kW'});
+
+filename = 'ETAP_Infrastructure_Profile.csv';
+writetable(etap_export_table, filename);
+fprintf('Data successfully compiled and saved to target destination: %s\n', filename);
